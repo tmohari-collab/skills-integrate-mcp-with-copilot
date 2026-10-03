@@ -5,19 +5,120 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import logging
+import os
+import secrets
+from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
-from pathlib import Path
+
+from src.teacher_auth import (
+    create_session_token,
+    load_teacher_credentials,
+    password_matches,
+    read_session_token,
+)
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
-          "static")), name="static")
+app.mount("/static", StaticFiles(directory=os.path.join(current_dir, "static")),
+          name="static")
+
+TEACHERS_FILE = current_dir / "teachers.json"
+SESSION_COOKIE = "teacher_session"
+SESSION_MAX_AGE = 60 * 60
+SESSION_SECRET = os.environ.get("SESSION_SECRET")
+if SESSION_SECRET is None:
+    SESSION_SECRET_BYTES = secrets.token_bytes(32)
+    logger.warning(
+        "SESSION_SECRET is not set; teacher sessions will not persist across "
+        "server restarts or work across multiple workers."
+    )
+else:
+    SESSION_SECRET_BYTES = SESSION_SECRET.encode("utf-8")
+    if len(SESSION_SECRET_BYTES) < 32:
+        raise ValueError("SESSION_SECRET must contain at least 32 bytes")
+
+COOKIE_SECURE_VALUE = os.environ.get("COOKIE_SECURE", "false").lower()
+if COOKIE_SECURE_VALUE not in {"true", "false"}:
+    raise ValueError("COOKIE_SECURE must be either 'true' or 'false'")
+COOKIE_SECURE = COOKIE_SECURE_VALUE == "true"
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+def require_teacher(request: Request) -> str:
+    token = request.cookies.get(SESSION_COOKIE)
+    username = read_session_token(token, SESSION_SECRET_BYTES)
+    if username is None:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
+
+
+@app.post("/auth/login")
+def login(credentials: LoginRequest, response: Response):
+    """Authenticate a teacher and issue a signed, HTTP-only session cookie."""
+    try:
+        teachers = load_teacher_credentials(TEACHERS_FILE)
+    except (OSError, ValueError) as error:
+        logger.exception("Could not load teacher credentials")
+        raise HTTPException(
+            status_code=500,
+            detail="Teacher credential configuration is unavailable",
+        ) from error
+
+    username = credentials.username.strip()
+    teacher = next(
+        (entry for entry in teachers if entry["username"] == username),
+        None,
+    )
+    if not password_matches(credentials.password, teacher):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=create_session_token(username, SESSION_SECRET_BYTES, SESSION_MAX_AGE),
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return {"authenticated": True, "username": username}
+
+
+@app.get("/auth/session")
+def get_session(request: Request):
+    """Return the current teacher-session status without exposing credentials."""
+    username = read_session_token(
+        request.cookies.get(SESSION_COOKIE),
+        SESSION_SECRET_BYTES,
+    )
+    return {"authenticated": username is not None, "username": username}
+
+
+@app.post("/auth/logout")
+def logout(response: Response):
+    """Clear the teacher session cookie."""
+    response.delete_cookie(
+        key=SESSION_COOKIE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    return {"authenticated": False}
 
 # In-memory activity database
 activities = {
@@ -88,9 +189,15 @@ def get_activities():
     return activities
 
 
-@app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+@app.post(
+    "/activities/{activity_name}/signup",
+    dependencies=[Depends(require_teacher)],
+)
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+):
+    """Register a student for an activity (teachers only)."""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -110,9 +217,15 @@ def signup_for_activity(activity_name: str, email: str):
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
-@app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+@app.delete(
+    "/activities/{activity_name}/unregister",
+    dependencies=[Depends(require_teacher)],
+)
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+):
+    """Unregister a student from an activity (teachers only)."""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
